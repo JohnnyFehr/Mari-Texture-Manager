@@ -29,10 +29,17 @@ UNCACHED_DELAY_MS = 700
 
 # Folder search: subfolders are indexed in small time slices so the UI never freezes
 INDEX_TIME_BUDGET_MS = 20
+INDEX_TICK_MS = 10
 MAX_FOLDER_MATCHES = 300
 
+# Settings file (portable, can be copied between machines)
+SETTINGS_FILE = os.path.expanduser("~/.mari_texture_manager/settings.ini")
+
+# Show the palette when Mari starts. Set to False if you only want it via View > Palettes.
+SHOW_ON_STARTUP = True
+
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".tif", ".tiff", ".tga", ".bmp",
-                    ".exr", ".tx", ".hdr", ".psd")
+                    ".exr", ".tx", ".hdr")
 
 PATH_ROLE = QtCore.Qt.ItemDataRole.UserRole
 
@@ -43,12 +50,55 @@ except NameError:
     _widget = None
 
 
+def log(message, error=False):
+    """Writes to the Python console and the Mari log."""
+    text = "TEXTURE MANAGER: " + message
+    print(text)
+    try:
+        mari.app.log(text)
+    except Exception:
+        pass
+    if error:
+        traceback.print_exc()
+
+
 def normalize_path(path):
     path = path.strip().strip('"').strip("'")
     if not path:
         return ""
     path = os.path.normpath(os.path.expanduser(path))
     return path.replace("\\", "/")
+
+
+def child_path(folder, name):
+    """Joins without producing 'X://name' when the folder is a drive root like 'X:/'."""
+    return folder + name if folder.endswith("/") else folder + "/" + name
+
+
+def relative_parts(path, root):
+    """['a', 'b'] for path 'X:/root/a/b' below root 'X:/root'. None if path is not below root."""
+    prefix = root if root.endswith("/") else root + "/"
+    if not path.startswith(prefix) or path == prefix:
+        return None
+    return path[len(prefix):].split("/")
+
+
+def to_int(value, default=0):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def get_settings():
+    """INI file in the user's home. Migrates settings from the old registry/native location once."""
+    settings = QtCore.QSettings(SETTINGS_FILE, QtCore.QSettings.Format.IniFormat)
+    if not os.path.isfile(SETTINGS_FILE):
+        old = QtCore.QSettings("TextureManager", "MariTextureManager")
+        for key in old.allKeys():
+            settings.setValue(key, old.value(key))
+        settings.sync()
+    return settings
 
 
 def get_qt_formats():
@@ -67,7 +117,7 @@ def get_qt_formats():
 
 def get_cache_path(path):
     folder, name = os.path.split(path)
-    return "{}/{}/{}.thumb{}.jpg".format(folder, CACHE_FOLDER_NAME, name, THUMB_SIZE)
+    return child_path(child_path(folder, CACHE_FOLDER_NAME), "{}.thumb{}.jpg".format(name, THUMB_SIZE))
 
 
 def is_cache_valid(path):
@@ -78,12 +128,21 @@ def is_cache_valid(path):
         return False
 
 
+# Cache folders that could not be written (e.g. read-only shares), reported once each
+_cache_failed_dirs = set()
+
+
 def save_thumbnail_cache(image, cache_path):
+    cache_dir = os.path.dirname(cache_path)
+    if cache_dir in _cache_failed_dirs:
+        return
     try:
-        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-        image.convertToFormat(QtGui.QImage.Format.Format_RGB888).save(cache_path, "JPG", 85)
+        os.makedirs(cache_dir, exist_ok=True)
+        if not image.convertToFormat(QtGui.QImage.Format.Format_RGB888).save(cache_path, "JPG", 85):
+            raise OSError("QImage.save failed")
     except Exception as exc:
-        print("TEXTURE MANAGER: Could not write cache ({}): {}".format(cache_path, exc))
+        _cache_failed_dirs.add(cache_dir)
+        log("Could not write cache to {} ({}). Thumbnails there will not be cached.".format(cache_dir, exc))
 
 
 def load_thumbnail(path):
@@ -119,7 +178,7 @@ def load_thumbnail(path):
             QtGui.QImageReader.setAllocationLimit(old_limit)
 
     if image.isNull():
-        print("TEXTURE MANAGER: Preview failed for {}: {}".format(path, reader.errorString()))
+        log("Preview failed for {}: {}".format(path, reader.errorString()))
         return None, width, height
 
     save_thumbnail_cache(image, cache_path)
@@ -212,8 +271,23 @@ def make_happy_smiley_icon(color, size=THUMB_SIZE):
     return QtGui.QIcon(pixmap)
 
 
+def find_loaded_image(path):
+    """Returns the Image Manager entry for this file if it is already loaded, else None."""
+    try:
+        for image in mari.images.list():
+            if normalize_path(image.filePath()) == path:
+                return image
+    except Exception:
+        pass
+    return None
+
+
 def load_image_into_manager(path):
-    return mari.images.open(path)
+    """Returns (image, already_loaded)."""
+    existing = find_loaded_image(path)
+    if existing is not None:
+        return existing, True
+    return mari.images.open(path), False
 
 
 def create_image_group(name, images):
@@ -222,8 +296,7 @@ def create_image_group(name, images):
         mari.images.addToImageGroup(list(images), name)
         return True
     except Exception as exc:
-        traceback.print_exc()
-        mari.app.log("TEXTURE MANAGER: addToImageGroup failed: {}".format(exc))
+        log("addToImageGroup failed: {}".format(exc), error=True)
         return False
 
 
@@ -242,7 +315,8 @@ class FolderFilterProxy(QtCore.QSortFilterProxyModel):
 
     A folder is shown if its name, or the name of any of its parents below the root,
     matches a keyword. Recursive filtering keeps the parents of matching subfolders visible.
-    Only folders Qt has already loaded can match (first level + expanded folders)."""
+    Subfolders that Qt has not loaded yet are found by the folder index in LibraryTab,
+    which loads and expands them."""
 
     def __init__(self, parent=None):
         super(FolderFilterProxy, self).__init__(parent)
@@ -265,12 +339,10 @@ class FolderFilterProxy(QtCore.QSortFilterProxyModel):
             return True
 
         # The root and its parents (drive etc.) must stay visible, otherwise the tree is empty
-        path = normalize_path(model.filePath(index))
-        if not path.startswith(self.root_path + "/"):
+        parts = relative_parts(normalize_path(model.filePath(index)), self.root_path)
+        if parts is None:
             return True
-
-        relative_parts = path[len(self.root_path) + 1:].split("/")
-        return any(matches_keywords(part, self.keywords) for part in relative_parts)
+        return any(matches_keywords(part, self.keywords) for part in parts)
 
 
 class LibraryTab(QtWidgets.QWidget):
@@ -283,7 +355,7 @@ class LibraryTab(QtWidgets.QWidget):
         self.root_changed_callback = None   # set by the tab container to update the tab title
         self.current_path = ""
         self.root_path = ""
-        self.settings = QtCore.QSettings("TextureManager", "MariTextureManager")
+        self.settings = get_settings()
 
         # Thumbnails are loaded one per timer tick on the main thread
         self.generation = 0          # incremented on every folder change, drops stale results
@@ -323,7 +395,7 @@ class LibraryTab(QtWidgets.QWidget):
         path_layout.addWidget(self.path_field)
         path_layout.addWidget(self.browse_btn)
 
-        # Search field, filters folders (left) and images (right)
+        # Search field, filters the folder tree
         self.search_field = QtWidgets.QLineEdit()
         self.search_field.setPlaceholderText("Filter folders ... (comma = multiple keywords)")
         self.search_field.setClearButtonEnabled(True)
@@ -341,10 +413,10 @@ class LibraryTab(QtWidgets.QWidget):
         self.index_queue = deque()    # folders still to scan
         self.index_done = False
         self.matched_folders = set()
-        self.image_filter_info = ""
+        self.index_visited = set()    # real paths, protects against symlink loops
 
         self.index_timer = QtCore.QTimer(self)
-        self.index_timer.setInterval(0)
+        self.index_timer.setInterval(INDEX_TICK_MS)
         self.index_timer.timeout.connect(self.process_index_queue)
 
         icon_provider = QtWidgets.QFileIconProvider()
@@ -398,6 +470,7 @@ class LibraryTab(QtWidgets.QWidget):
         self.up_btn.clicked.connect(self.on_up)
         self.folder_tree.selectionModel().currentChanged.connect(self.on_tree_current_changed)
         self.image_list.customContextMenuRequested.connect(self.on_image_context_menu)
+        self.image_list.itemDoubleClicked.connect(self.on_image_double_clicked)
 
         # ---------------- Restore last location ----------------
         last_root = self.settings.value(self.key("last_root"), "")
@@ -408,9 +481,9 @@ class LibraryTab(QtWidgets.QWidget):
             last_path = self.settings.value("last_path", "")
         if last_root and os.path.isdir(last_root):
             self.set_path(last_root)
-            if last_path and last_path != last_root and os.path.isdir(last_path) \
-                    and normalize_path(last_path).startswith(self.root_path + "/"):
-                self.select_in_tree(normalize_path(last_path))
+            last_path = normalize_path(last_path)
+            if last_path and os.path.isdir(last_path) and relative_parts(last_path, self.root_path):
+                self.select_in_tree(last_path)
         elif last_path and os.path.isdir(last_path):
             self.set_path(last_path)
         else:
@@ -494,7 +567,7 @@ class LibraryTab(QtWidgets.QWidget):
 
         no_preview = 0
         for name in images:
-            path = self.current_path + "/" + name
+            path = child_path(self.current_path, name)
             item = QtWidgets.QListWidgetItem(self.file_icon, name)
             item.setData(PATH_ROLE, path)
             item.setToolTip(path)
@@ -524,7 +597,7 @@ class LibraryTab(QtWidgets.QWidget):
         if no_preview:
             status += " ({} without preview)".format(no_preview)
         self.base_status = status
-        self.apply_image_filter()
+        self.update_status()
 
     # ---------------- Search ----------------
 
@@ -546,17 +619,10 @@ class LibraryTab(QtWidgets.QWidget):
             # Search cleared -> collapse everything again
             self.folder_tree.collapseAll()
 
-        self.apply_image_filter()
-
-    def apply_image_filter(self):
-        """The search only filters folders, images are always shown."""
-        self.image_filter_info = ""
         self.update_status()
 
     def update_status(self):
         parts = [self.base_status]
-        if self.image_filter_info:
-            parts.append(self.image_filter_info)
         if self.keywords:
             folders = "{} folder matches".format(len(self.matched_folders))
             if len(self.matched_folders) >= MAX_FOLDER_MATCHES:
@@ -574,6 +640,7 @@ class LibraryTab(QtWidgets.QWidget):
         self.index_queue = deque([self.root_path]) if self.root_path else deque()
         self.index_done = not self.root_path
         self.matched_folders = set()
+        self.index_visited = set()
 
     def process_index_queue(self):
         """Scans folders for a few milliseconds per timer tick, so the UI stays responsive."""
@@ -583,16 +650,21 @@ class LibraryTab(QtWidgets.QWidget):
         while self.index_queue and time.monotonic() - start < budget:
             folder = self.index_queue.popleft()
             try:
+                real = os.path.realpath(folder)
+                if real in self.index_visited:
+                    continue  # symlink pointing to a folder we already scanned
+                self.index_visited.add(real)
                 with os.scandir(folder) as entries:
+                    # Follows symlinks, like the tree and the image grid do
                     subfolders = [e.name for e in entries
-                                  if e.is_dir(follow_symlinks=False)
+                                  if e.is_dir()
                                   and e.name != CACHE_FOLDER_NAME
                                   and not e.name.startswith(".")]
             except OSError:
                 continue
 
             for name in sorted(subfolders, key=lambda n: n.lower()):
-                path = folder + "/" + name
+                path = child_path(folder, name)
                 self.folder_index.append(path)
                 self.index_queue.append(path)
                 if self.keywords:
@@ -602,11 +674,12 @@ class LibraryTab(QtWidgets.QWidget):
             self.index_done = True
             self.index_timer.stop()
 
+        if not self.keywords or len(self.matched_folders) >= MAX_FOLDER_MATCHES:
+            # Nobody is searching any more, or enough matches: pause until the next search
+            self.index_timer.stop()
+
         if self.keywords:
             self.update_status()
-        else:
-            # Nobody is searching any more, pause indexing until the next search
-            self.index_timer.stop()
 
     def check_folder_match(self, path):
         """If the folder name matches, make it visible in the tree and expand its parents."""
@@ -628,10 +701,10 @@ class LibraryTab(QtWidgets.QWidget):
     def reveal_in_tree(self, path):
         """Makes Qt load the folder (and its parents) and expands the parents."""
         self.fs_model.index(path)
-        relative_parts = path[len(self.root_path) + 1:].split("/")
+        parts = relative_parts(path, self.root_path) or []
         current = self.root_path
-        for part in relative_parts[:-1]:
-            current = current + "/" + part
+        for part in parts[:-1]:
+            current = child_path(current, part)
             proxy_index = self.folder_proxy.mapFromSource(self.fs_model.index(current))
             if proxy_index.isValid():
                 self.folder_tree.expand(proxy_index)
@@ -704,6 +777,9 @@ class LibraryTab(QtWidgets.QWidget):
         if path and path != self.current_path:
             self.show_folder(path)
 
+    def on_image_double_clicked(self, item):
+        self.add_to_image_manager([item.data(PATH_ROLE)])
+
     def on_image_context_menu(self, pos):
         item = self.image_list.itemAt(pos)
         if item is None:
@@ -748,10 +824,12 @@ class LibraryTab(QtWidgets.QWidget):
 
         images = []
         failed = []
+        already = 0
         first_error = ""
         for path in paths:
             try:
-                result = load_image_into_manager(path)
+                result, was_loaded = load_image_into_manager(path)
+                already += int(was_loaded)
                 if isinstance(result, (list, tuple)):
                     images.extend(result)
                 elif result is not None:
@@ -762,14 +840,15 @@ class LibraryTab(QtWidgets.QWidget):
             except Exception as exc:
                 failed.append(os.path.basename(path))
                 first_error = first_error or "{}: {}".format(type(exc).__name__, exc)
-                traceback.print_exc()
-                mari.app.log("TEXTURE MANAGER: Failed to load {}: {}".format(path, exc))
+                log("Failed to load {}: {}".format(path, exc), error=True)
 
         if not images:
             self.set_status("Nothing loaded: " + first_error, error=True)
             return
 
-        status = "{} image(s) loaded into the Image Manager".format(len(images))
+        status = "{} image(s) loaded into the Image Manager".format(len(images) - already)
+        if already:
+            status += ", {} already loaded".format(already)
 
         if len(paths) > 1:
             if create_image_group(group_name, images):
@@ -805,7 +884,7 @@ class TextureManagerWidget(QtWidgets.QWidget):
 
     def __init__(self, parent=None):
         super(TextureManagerWidget, self).__init__(parent)
-        self.settings = QtCore.QSettings("TextureManager", "MariTextureManager")
+        self.settings = get_settings()
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -829,11 +908,12 @@ class TextureManagerWidget(QtWidgets.QWidget):
         self.tabs.tabBar().tabBarDoubleClicked.connect(self.on_rename_tab)
 
         # Restore tabs ("0" is also the tab that inherits settings from before tabs existed)
-        tab_ids = [t for t in str(self.settings.value("tab_ids", "") or "").split(",") if t]
+        tab_ids = [t.strip() for t in str(self.settings.value("tab_ids", "") or "").split(",")
+                   if t.strip().isdigit()]
         for tab_id in tab_ids or ["0"]:
             self.add_tab(tab_id)
-        self.tabs.setCurrentIndex(min(int(self.settings.value("current_tab", 0) or 0),
-                                      self.tabs.count() - 1))
+        current = to_int(self.settings.value("current_tab", 0))
+        self.tabs.setCurrentIndex(max(0, min(current, self.tabs.count() - 1)))
         self.tabs.currentChanged.connect(lambda i: self.settings.setValue("current_tab", i))
         self.save_tab_order()
 
@@ -842,7 +922,7 @@ class TextureManagerWidget(QtWidgets.QWidget):
 
     def add_tab(self, tab_id=None):
         if tab_id is None:
-            used = [int(t.tab_id) for t in self.all_tabs()]
+            used = [to_int(t.tab_id) for t in self.all_tabs()]
             tab_id = str(max(used) + 1 if used else 0)
         tab = LibraryTab(tab_id)
         tab.root_changed_callback = self.update_tab_title
@@ -904,7 +984,8 @@ def create_palette():
     """Creates the palette, removing an existing one first (safe to re-run)."""
     global _widget
 
-    if _widget is not None:
+    is_reload = _widget is not None
+    if is_reload:
         try:
             _widget.stop()
         except Exception:
@@ -919,10 +1000,14 @@ def create_palette():
     _widget = TextureManagerWidget()
     palette = mari.palettes.create(PALETTE_NAME, _widget)
 
+    # On a manual re-run bring it to the front; on Mari startup only show it without stealing focus
     try:
-        palette.showInFront()
+        if is_reload:
+            palette.showInFront()
+        elif SHOW_ON_STARTUP:
+            palette.show()
     except Exception:
-        palette.show()
+        pass
 
     return palette
 
